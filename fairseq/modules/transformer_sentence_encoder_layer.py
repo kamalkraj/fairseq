@@ -8,7 +8,7 @@ from typing import Callable, Optional
 import torch
 import torch.nn as nn
 from fairseq import utils
-from fairseq.modules import LayerNorm, MultiheadAttention
+from fairseq.modules import LayerNorm, SelfMultiheadAttention
 from fairseq.modules.fairseq_dropout import FairseqDropout
 from fairseq.modules.quant_noise import quant_noise
 
@@ -32,6 +32,8 @@ class TransformerSentenceEncoderLayer(nn.Module):
         q_noise: float = 0.0,
         qn_block_size: int = 8,
         init_fn: Callable = None,
+        # new added
+        encoder_normalize_before: bool = False,
     ) -> None:
         super().__init__()
 
@@ -52,15 +54,15 @@ class TransformerSentenceEncoderLayer(nn.Module):
             activation_dropout, module_name=self.__class__.__name__
         )
 
+        # new added
+        self.normalize_before = encoder_normalize_before
+
         # Initialize blocks
         self.activation_fn = utils.get_activation_fn(activation_fn)
         self.self_attn = self.build_self_attention(
             self.embedding_dim,
             num_attention_heads,
             dropout=attention_dropout,
-            self_attention=True,
-            q_noise=q_noise,
-            qn_block_size=qn_block_size,
         )
 
         # layer norm associated with the self attention layer
@@ -93,22 +95,17 @@ class TransformerSentenceEncoderLayer(nn.Module):
         embed_dim,
         num_attention_heads,
         dropout,
-        self_attention,
-        q_noise,
-        qn_block_size,
     ):
-        return MultiheadAttention(
+        return SelfMultiheadAttention(
             embed_dim,
             num_attention_heads,
             dropout=dropout,
-            self_attention=True,
-            q_noise=q_noise,
-            qn_block_size=qn_block_size,
         )
 
     def forward(
         self,
         x: torch.Tensor,
+        attn_bias: Optional[torch.Tensor] = None,
         self_attn_mask: Optional[torch.Tensor] = None,
         self_attn_padding_mask: Optional[torch.Tensor] = None,
     ):
@@ -117,23 +114,37 @@ class TransformerSentenceEncoderLayer(nn.Module):
         modules similar to the original Transformer implementation.
         """
         residual = x
+        # new added
+        x = self.maybe_layer_norm(self.self_attn_layer_norm, x, before=True)
         x, attn = self.self_attn(
             query=x,
-            key=x,
-            value=x,
             key_padding_mask=self_attn_padding_mask,
             need_weights=False,
             attn_mask=self_attn_mask,
+            attn_bias=attn_bias,
         )
+        # sometimes padding tokens can have nowhere to attend, just set their values to zero 
+        x[x != x] = 0 
         x = self.dropout_module(x)
         x = residual + x
-        x = self.self_attn_layer_norm(x)
+        # change 
+        x = self.maybe_layer_norm(self.self_attn_layer_norm, x, after=True)
+        # x = self.self_attn_layer_norm(x)
 
         residual = x
+        x = self.maybe_layer_norm(self.final_layer_norm, x, before=True)
         x = self.activation_fn(self.fc1(x))
         x = self.activation_dropout_module(x)
         x = self.fc2(x)
         x = self.dropout_module(x)
         x = residual + x
-        x = self.final_layer_norm(x)
+        x = self.maybe_layer_norm(self.final_layer_norm, x, after=True)
+        # x = self.final_layer_norm(x)
         return x, attn
+
+    def maybe_layer_norm(self, layer_norm, x, before=False, after=False):
+        assert before ^ after
+        if after ^ self.normalize_before:
+            return layer_norm(x)
+        else:
+            return x

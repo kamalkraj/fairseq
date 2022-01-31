@@ -152,6 +152,7 @@ and [RoBERTa](https://pytorch.org/hub/pytorch_fairseq_roberta/) for more example
 git clone https://github.com/pytorch/fairseq
 cd fairseq
 pip install --editable ./
+pip install --editable fused_ops/
 
 # on MacOS:
 # CFLAGS="-stdlib=libc++" pip install --editable ./

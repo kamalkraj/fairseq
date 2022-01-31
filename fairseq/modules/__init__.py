@@ -29,7 +29,7 @@ from .lightweight_convolution import LightweightConv, LightweightConv1dTBC
 from .linearized_convolution import LinearizedConvolution
 from .location_attention import LocationAttention
 from .lstm_cell_with_zoneout import LSTMCellWithZoneOut
-from .multihead_attention import MultiheadAttention
+from .multihead_attention import MultiheadAttention, SelfMultiheadAttention
 from .positional_embedding import PositionalEmbedding
 from .same_pad import SamePad
 from .scalar_bias import ScalarBias

@@ -4,7 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +15,212 @@ from fairseq.modules.quant_noise import quant_noise
 from torch import Tensor, nn
 from torch.nn import Parameter
 
+try:
+    import fused_softmax_dropout_cuda
+except ImportError:
+    fused_softmax_dropout_cuda = None
+    print("import fused_softmax_dropout_cuda, please install fused_ops", file=sys.stderr)
+
+
+
+class SoftmaxDropout(torch.autograd.Function) :
+    @staticmethod
+    def forward(ctx, is_training, heads, inputs, dropout_prob):
+        heads_t        = torch.tensor([heads])
+        dropout_prob_t = torch.tensor([dropout_prob])
+        dropout_results,                                                \
+        dropout_mask,                                                   \
+        softmax_results =                                                \
+                fused_softmax_dropout_cuda.forward(                           \
+                                    is_training,                              \
+                                    heads,                                    \
+                                    inputs,                                   \
+                                    dropout_prob)
+        if is_training:
+            ctx.save_for_backward(
+                                heads_t,                                 \
+                                softmax_results,                          \
+                                dropout_mask,                             \
+                                dropout_prob_t)
+
+        if is_training:
+            return dropout_results.detach()
+        else:
+            return softmax_results.detach()
+
+    @staticmethod
+    def backward(ctx, output_grads):
+        heads_t,   \
+        softmax_results,                                                \
+        dropout_mask,                                              \
+        dropout_prob_t      = ctx.saved_tensors
+
+        input_grads =                                                    \
+            fused_softmax_dropout_cuda.backward(                          \
+                                heads_t[0],                             \
+                                output_grads,                             \
+                                softmax_results,                          \
+                                dropout_mask,                             \
+                                dropout_prob_t[0])
+        return None, None, input_grads, None, 
+
+fast_softmax_dropout_func = SoftmaxDropout.apply
+
+class SelfMultiheadAttention(nn.Module):
+    """Multi-headed attention.
+
+    See "Attention Is All You Need" for more details.
+    """
+
+    def __init__(
+        self,
+        embed_dim,
+        num_heads,
+        dropout=0.0,
+        bias=True,
+        scaling_factor=1,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+
+        self.num_heads = num_heads
+        self.dropout = dropout
+
+        self.head_dim = embed_dim // num_heads
+        assert (
+            self.head_dim * num_heads == self.embed_dim
+        ), "embed_dim must be divisible by num_heads"
+        self.scaling = (self.head_dim * scaling_factor) ** -0.5
+
+        self.in_proj = nn.Linear(embed_dim, embed_dim * 3, bias=bias)
+
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        self.onnx_trace = False
+        self.tpu = False
+
+
+    def prepare_for_onnx_export_(self):
+        self.onnx_trace = True
+
+    def prepare_for_tpu_(self, **kwargs):
+        self.tpu = True
+
+    def forward(
+        self,
+        query,
+        key_padding_mask: Optional[Tensor] = None,
+        need_weights: bool = True,
+        attn_mask: Optional[Tensor] = None,
+        attn_bias: Optional[Tensor] = None,
+        before_softmax: bool = False,
+        need_head_weights: bool = False,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """Input shape: Time x Batch x Channel
+
+        Args:
+            key_padding_mask (ByteTensor, optional): mask to exclude
+                keys that are pads, of shape `(batch, src_len)`, where
+                padding elements are indicated by 1s.
+            need_weights (bool, optional): return the attention weights,
+                averaged over heads (default: False).
+            attn_mask (ByteTensor, optional): typically used to
+                implement causal attention, where the mask prevents the
+                attention from looking forward in time (default: None).
+            before_softmax (bool, optional): return the raw attention
+                weights and values before the attention softmax.
+            need_head_weights (bool, optional): return the attention
+                weights for each head. Implies *need_weights*. Default:
+                return the average attention weights over all heads.
+        """
+        if need_head_weights:
+            need_weights = True
+
+        tgt_len, bsz, embed_dim = query.size()
+        assert embed_dim == self.embed_dim
+        assert list(query.size()) == [tgt_len, bsz, embed_dim]
+
+        q, k, v = self.in_proj(query).chunk(3,dim=-1) #, self.k_proj(query), self.v_proj(query)
+        q = (
+            q.contiguous().view(tgt_len, bsz * self.num_heads, self.head_dim)
+            .transpose(0, 1) * self.scaling
+        )
+        if k is not None:
+            k = (
+                k.contiguous().view(-1, bsz * self.num_heads, self.head_dim)
+                .transpose(0, 1)
+            )
+        if v is not None:
+            v = (
+                v.contiguous().view(-1, bsz * self.num_heads, self.head_dim)
+                .transpose(0, 1)
+            )
+
+        assert k is not None
+        src_len = k.size(1)
+
+        # This is part of a workaround to get around fork/join parallelism
+        # not supporting Optional types.
+        if key_padding_mask is not None and key_padding_mask.dim() == 0:
+            key_padding_mask = None
+
+        if key_padding_mask is not None:
+            assert key_padding_mask.size(0) == bsz
+            assert key_padding_mask.size(1) == src_len
+
+
+        attn_weights = torch.bmm(q, k.transpose(1, 2))
+
+        assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
+
+        if attn_mask is not None:
+            attn_mask = attn_mask.unsqueeze(0)
+            if self.onnx_trace:
+                attn_mask = attn_mask.repeat(attn_weights.size(0), 1, 1)
+            attn_weights += attn_mask
+
+        if key_padding_mask is not None:
+            # don't attend to padding symbols
+            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+            if not self.tpu:
+                attn_weights.masked_fill_(
+                    key_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool),
+                    float("-inf")
+                )
+            else:
+                attn_weights = attn_weights.transpose(0, 2)
+                attn_weights = attn_weights.masked_fill(key_padding_mask, float('-inf'))
+                attn_weights = attn_weights.transpose(0, 2)
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+        if attn_bias is not None:
+            attn_weights += attn_bias
+
+        if before_softmax:
+            return attn_weights, v
+        
+        attn_probs = fast_softmax_dropout_func(self.training, self.num_heads, attn_weights, self.dropout)
+
+        assert v is not None
+        attn = torch.bmm(attn_probs, v)
+        assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
+        if self.onnx_trace and attn.size(1) == 1:
+            # when ONNX tracing a single decoder step (sequence length == 1)
+            # the transpose is a no-op copy before view, thus unnecessary
+            attn = attn.contiguous().view(tgt_len, bsz, embed_dim)
+        else:
+            attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
+        attn = self.out_proj(attn)
+        ret_attn_weights = None
+        if need_weights:
+            ret_attn_weights = attn_weights.view(
+                bsz, self.num_heads, tgt_len, src_len
+            ).transpose(1, 0)
+            if not need_head_weights:
+                # average attention weights over heads
+                ret_attn_weights = attn_weights.mean(dim=0)
+
+        return attn, ret_attn_weights
 
 @with_incremental_state
 class MultiheadAttention(nn.Module):
@@ -45,9 +251,10 @@ class MultiheadAttention(nn.Module):
         self.qkv_same_dim = self.kdim == embed_dim and self.vdim == embed_dim
 
         self.num_heads = num_heads
-        self.dropout_module = FairseqDropout(
-            dropout, module_name=self.__class__.__name__
-        )
+        # self.dropout_module = FairseqDropout(
+        #     dropout, module_name=self.__class__.__name__
+        # )
+        self.dropout = dropout
 
         self.head_dim = embed_dim // num_heads
         assert (
@@ -62,19 +269,34 @@ class MultiheadAttention(nn.Module):
             "Self-attention requires query, key and " "value to be of the same size"
         )
 
-        self.k_proj = quant_noise(
-            nn.Linear(self.kdim, embed_dim, bias=bias), q_noise, qn_block_size
-        )
-        self.v_proj = quant_noise(
-            nn.Linear(self.vdim, embed_dim, bias=bias), q_noise, qn_block_size
-        )
-        self.q_proj = quant_noise(
-            nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size
-        )
+        # Edit
+        if self.qkv_same_dim:
+            self.in_proj_weight = Parameter(torch.Tensor(3 * embed_dim, embed_dim))
+        else:
+            self.k_proj_weight = Parameter(torch.Tensor(embed_dim, self.kdim))
+            self.v_proj_weight = Parameter(torch.Tensor(embed_dim, self.vdim))
+            self.q_proj_weight = Parameter(torch.Tensor(embed_dim, embed_dim))
 
-        self.out_proj = quant_noise(
-            nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size
-        )
+        if bias:
+            self.in_proj_bias = Parameter(torch.Tensor(3 * embed_dim))
+        else:
+            self.register_parameter('in_proj_bias', None)
+
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        # self.k_proj = quant_noise(
+        #     nn.Linear(self.kdim, embed_dim, bias=bias), q_noise, qn_block_size
+        # )
+        # self.v_proj = quant_noise(
+        #     nn.Linear(self.vdim, embed_dim, bias=bias), q_noise, qn_block_size
+        # )
+        # self.q_proj = quant_noise(
+        #     nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size
+        # )
+
+        # self.out_proj = quant_noise(
+        #     nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size
+        # )
 
         if add_bias_kv:
             self.bias_k = Parameter(torch.Tensor(1, 1, embed_dim))
@@ -87,158 +309,45 @@ class MultiheadAttention(nn.Module):
         self.reset_parameters()
 
         self.onnx_trace = False
-        self.skip_embed_dim_check = False
+
+        self.enable_torch_version = False
+        if hasattr(F, "multi_head_attention_forward"):
+            self.enable_torch_version = True
+        else:
+            self.enable_torch_version = False
 
     def prepare_for_onnx_export_(self):
         self.onnx_trace = True
 
     def reset_parameters(self):
         if self.qkv_same_dim:
-            # Empirically observed the convergence to be much better with
-            # the scaled initialization
-            nn.init.xavier_uniform_(self.k_proj.weight, gain=1 / math.sqrt(2))
-            nn.init.xavier_uniform_(self.v_proj.weight, gain=1 / math.sqrt(2))
-            nn.init.xavier_uniform_(self.q_proj.weight, gain=1 / math.sqrt(2))
+            nn.init.xavier_uniform_(self.in_proj_weight)
         else:
-            nn.init.xavier_uniform_(self.k_proj.weight)
-            nn.init.xavier_uniform_(self.v_proj.weight)
-            nn.init.xavier_uniform_(self.q_proj.weight)
+            nn.init.xavier_uniform_(self.k_proj_weight)
+            nn.init.xavier_uniform_(self.v_proj_weight)
+            nn.init.xavier_uniform_(self.q_proj_weight)
+
+        # if self.qkv_same_dim:
+        #     # Empirically observed the convergence to be much better with
+        #     # the scaled initialization
+        #     nn.init.xavier_uniform_(self.k_proj.weight, gain=1 / math.sqrt(2))
+        #     nn.init.xavier_uniform_(self.v_proj.weight, gain=1 / math.sqrt(2))
+        #     nn.init.xavier_uniform_(self.q_proj.weight, gain=1 / math.sqrt(2))
+        # else:
+        #     nn.init.xavier_uniform_(self.k_proj.weight)
+        #     nn.init.xavier_uniform_(self.v_proj.weight)
+        #     nn.init.xavier_uniform_(self.q_proj.weight)
 
         nn.init.xavier_uniform_(self.out_proj.weight)
-        if self.out_proj.bias is not None:
-            nn.init.constant_(self.out_proj.bias, 0.0)
+        if self.in_proj_bias is not None:
+            nn.init.constant_(self.in_proj_bias, 0.)
+            nn.init.constant_(self.out_proj.bias, 0.)
+        # if self.out_proj.bias is not None:
+        #     nn.init.constant_(self.out_proj.bias, 0.0)
         if self.bias_k is not None:
             nn.init.xavier_normal_(self.bias_k)
         if self.bias_v is not None:
             nn.init.xavier_normal_(self.bias_v)
-
-    def _get_reserve_head_index(self, num_heads_to_keep: int):
-        k_proj_heads_norm = []
-        q_proj_heads_norm = []
-        v_proj_heads_norm = []
-
-        for i in range(self.num_heads):
-            start_idx = i * self.head_dim
-            end_idx = (i + 1) * self.head_dim
-            k_proj_heads_norm.append(
-                torch.sum(
-                    torch.abs(
-                        self.k_proj.weight[
-                            start_idx:end_idx,
-                        ]
-                    )
-                ).tolist()
-                + torch.sum(torch.abs(self.k_proj.bias[start_idx:end_idx])).tolist()
-            )
-            q_proj_heads_norm.append(
-                torch.sum(
-                    torch.abs(
-                        self.q_proj.weight[
-                            start_idx:end_idx,
-                        ]
-                    )
-                ).tolist()
-                + torch.sum(torch.abs(self.q_proj.bias[start_idx:end_idx])).tolist()
-            )
-            v_proj_heads_norm.append(
-                torch.sum(
-                    torch.abs(
-                        self.v_proj.weight[
-                            start_idx:end_idx,
-                        ]
-                    )
-                ).tolist()
-                + torch.sum(torch.abs(self.v_proj.bias[start_idx:end_idx])).tolist()
-            )
-
-        heads_norm = []
-        for i in range(self.num_heads):
-            heads_norm.append(
-                k_proj_heads_norm[i] + q_proj_heads_norm[i] + v_proj_heads_norm[i]
-            )
-
-        sorted_head_index = sorted(
-            range(self.num_heads), key=lambda k: heads_norm[k], reverse=True
-        )
-        reserve_head_index = []
-        for i in range(num_heads_to_keep):
-            start = sorted_head_index[i] * self.head_dim
-            end = (sorted_head_index[i] + 1) * self.head_dim
-            reserve_head_index.append((start, end))
-        return reserve_head_index
-
-    def _adaptive_prune_heads(self, reserve_head_index: List[Tuple[int, int]]):
-        new_q_weight = []
-        new_q_bias = []
-        new_k_weight = []
-        new_k_bias = []
-        new_v_weight = []
-        new_v_bias = []
-        new_out_proj_weight = []
-
-        for ele in reserve_head_index:
-            start_idx, end_idx = ele
-            new_q_weight.append(
-                self.q_proj.weight[
-                    start_idx:end_idx,
-                ]
-            )
-            new_q_bias.append(self.q_proj.bias[start_idx:end_idx])
-
-            new_k_weight.append(
-                self.k_proj.weight[
-                    start_idx:end_idx,
-                ]
-            )
-
-            new_k_bias.append(self.k_proj.bias[start_idx:end_idx])
-
-            new_v_weight.append(
-                self.v_proj.weight[
-                    start_idx:end_idx,
-                ]
-            )
-            new_v_bias.append(self.v_proj.bias[start_idx:end_idx])
-
-            new_out_proj_weight.append(self.out_proj.weight[:, start_idx:end_idx])
-
-        new_q_weight = torch.cat(new_q_weight).detach()
-        new_k_weight = torch.cat(new_k_weight).detach()
-        new_v_weight = torch.cat(new_v_weight).detach()
-        new_out_proj_weight = torch.cat(new_out_proj_weight, dim=-1).detach()
-        new_q_weight.requires_grad = True
-        new_k_weight.requires_grad = True
-        new_v_weight.requires_grad = True
-        new_out_proj_weight.requires_grad = True
-
-        new_q_bias = torch.cat(new_q_bias).detach()
-        new_q_bias.requires_grad = True
-
-        new_k_bias = torch.cat(new_k_bias).detach()
-        new_k_bias.requires_grad = True
-
-        new_v_bias = torch.cat(new_v_bias).detach()
-        new_v_bias.requires_grad = True
-
-        self.q_proj.weight = torch.nn.Parameter(new_q_weight)
-        self.q_proj.bias = torch.nn.Parameter(new_q_bias)
-
-        self.k_proj.weight = torch.nn.Parameter(new_k_weight)
-        self.k_proj.bias = torch.nn.Parameter(new_k_bias)
-
-        self.v_proj.weight = torch.nn.Parameter(new_v_weight)
-        self.v_proj.bias = torch.nn.Parameter(new_v_bias)
-
-        self.out_proj.weight = torch.nn.Parameter(new_out_proj_weight)
-
-        self.num_heads = len(reserve_head_index)
-        self.embed_dim = self.head_dim * self.num_heads
-        self.q_proj.out_features = self.embed_dim
-        self.k_proj.out_features = self.embed_dim
-        self.v_proj.out_features = self.embed_dim
-
-    def _set_skip_embed_dim_check(self):
-        self.skip_embed_dim_check = True
 
     def forward(
         self,
@@ -276,57 +385,65 @@ class MultiheadAttention(nn.Module):
         is_tpu = query.device.type == "xla"
 
         tgt_len, bsz, embed_dim = query.size()
-        src_len = tgt_len
-        if not self.skip_embed_dim_check:
-            assert (
-                embed_dim == self.embed_dim
-            ), f"query dim {embed_dim} != {self.embed_dim}"
+        assert embed_dim == self.embed_dim
         assert list(query.size()) == [tgt_len, bsz, embed_dim]
-        if key is not None:
-            src_len, key_bsz, _ = key.size()
-            if not torch.jit.is_scripting():
-                assert key_bsz == bsz
-                assert value is not None
-                assert src_len, bsz == value.shape[:2]
 
-        if (
-            not self.onnx_trace
-            and not is_tpu  # don't use PyTorch version on TPUs
-            and incremental_state is None
-            and not static_kv
-            # A workaround for quantization to work. Otherwise JIT compilation
-            # treats bias in linear module as method.
-            and not torch.jit.is_scripting()
-            # The Multihead attention implemented in pytorch forces strong dimension check
-            # for input embedding dimention and K,Q,V projection dimension.
-            # Since pruning will break the dimension check and it is not easy to modify the pytorch API,
-            # it is preferred to bypass the pytorch MHA when we need to skip embed_dim_check
-            and not self.skip_embed_dim_check
-        ):
-            assert key is not None and value is not None
-            return F.multi_head_attention_forward(
-                query,
-                key,
-                value,
-                self.embed_dim,
-                self.num_heads,
-                torch.empty([0]),
-                torch.cat((self.q_proj.bias, self.k_proj.bias, self.v_proj.bias)),
-                self.bias_k,
-                self.bias_v,
-                self.add_zero_attn,
-                self.dropout_module.p,
-                self.out_proj.weight,
-                self.out_proj.bias,
-                self.training or self.dropout_module.apply_during_inference,
-                key_padding_mask,
-                need_weights,
-                attn_mask,
-                use_separate_proj_weight=True,
-                q_proj_weight=self.q_proj.weight,
-                k_proj_weight=self.k_proj.weight,
-                v_proj_weight=self.v_proj.weight,
-            )
+        if self.enable_torch_version and not self.onnx_trace and incremental_state is None and not static_kv:
+            if self.qkv_same_dim:
+                return F.multi_head_attention_forward(query, key, value,
+                                                      self.embed_dim, self.num_heads,
+                                                      self.in_proj_weight,
+                                                      self.in_proj_bias, self.bias_k, self.bias_v,
+                                                      self.add_zero_attn, self.dropout,
+                                                      self.out_proj.weight, self.out_proj.bias,
+                                                      self.training, key_padding_mask, need_weights,
+                                                      attn_mask)
+            else:
+                return F.multi_head_attention_forward(query, key, value,
+                                                      self.embed_dim, self.num_heads,
+                                                      torch.empty([0]),
+                                                      self.in_proj_bias, self.bias_k, self.bias_v,
+                                                      self.add_zero_attn, self.dropout,
+                                                      self.out_proj.weight, self.out_proj.bias,
+                                                      self.training, key_padding_mask, need_weights,
+                                                      attn_mask, use_separate_proj_weight=True,
+                                                      q_proj_weight=self.q_proj_weight,
+                                                      k_proj_weight=self.k_proj_weight,
+                                                      v_proj_weight=self.v_proj_weight)
+
+        # if (
+        #     not self.onnx_trace
+        #     and not is_tpu  # don't use PyTorch version on TPUs
+        #     and incremental_state is None
+        #     and not static_kv
+        #     # A workaround for quantization to work. Otherwise JIT compilation
+        #     # treats bias in linear module as method.
+        #     and not torch.jit.is_scripting()
+        # ):
+        #     assert key is not None and value is not None
+        #     return F.multi_head_attention_forward(
+        #         query,
+        #         key,
+        #         value,
+        #         self.embed_dim,
+        #         self.num_heads,
+        #         torch.empty([0]),
+        #         torch.cat((self.q_proj.bias, self.k_proj.bias, self.v_proj.bias)),
+        #         self.bias_k,
+        #         self.bias_v,
+        #         self.add_zero_attn,
+        #         self.dropout_module.p,
+        #         self.out_proj.weight,
+        #         self.out_proj.bias,
+        #         self.training or self.dropout_module.apply_during_inference,
+        #         key_padding_mask,
+        #         need_weights,
+        #         attn_mask,
+        #         use_separate_proj_weight=True,
+        #         q_proj_weight=self.q_proj.weight,
+        #         k_proj_weight=self.k_proj.weight,
+        #         v_proj_weight=self.v_proj.weight,
+        #     )
 
         if incremental_state is not None:
             saved_state = self._get_input_buffer(incremental_state)
@@ -406,7 +523,6 @@ class MultiheadAttention(nn.Module):
                 else:
                     assert k is not None
                     k = torch.cat([prev_key, k], dim=1)
-                src_len = k.size(1)
             if "prev_value" in saved_state:
                 _prev_value = saved_state["prev_value"]
                 assert _prev_value is not None
@@ -435,7 +551,7 @@ class MultiheadAttention(nn.Module):
             assert incremental_state is not None
             incremental_state = self._set_input_buffer(incremental_state, saved_state)
         assert k is not None
-        assert k.size(1) == src_len
+        src_len = k.size(1)
 
         # This is part of a workaround to get around fork/join parallelism
         # not supporting Optional types.
@@ -506,9 +622,9 @@ class MultiheadAttention(nn.Module):
         if self.onnx_trace and attn.size(1) == 1:
             # when ONNX tracing a single decoder step (sequence length == 1)
             # the transpose is a no-op copy before view, thus unnecessary
-            attn = attn.contiguous().view(tgt_len, bsz, self.embed_dim)
+            attn = attn.contiguous().view(tgt_len, bsz, embed_dim)
         else:
-            attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, self.embed_dim)
+            attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
         attn = self.out_proj(attn)
         attn_weights: Optional[Tensor] = None
         if need_weights:
@@ -540,27 +656,21 @@ class MultiheadAttention(nn.Module):
         # leaves the frame, there will be a time when prev or current
         # is None
         elif prev_key_padding_mask is not None:
-            if src_len > prev_key_padding_mask.size(1):
-                filler = torch.zeros(
-                    (batch_size, src_len - prev_key_padding_mask.size(1)),
-                    device=prev_key_padding_mask.device,
-                )
-                new_key_padding_mask = torch.cat(
-                    [prev_key_padding_mask.float(), filler.float()], dim=1
-                )
-            else:
-                new_key_padding_mask = prev_key_padding_mask.float()
+            filler = torch.zeros(
+                (batch_size, src_len - prev_key_padding_mask.size(1)),
+                device=prev_key_padding_mask.device,
+            )
+            new_key_padding_mask = torch.cat(
+                [prev_key_padding_mask.float(), filler.float()], dim=1
+            )
         elif key_padding_mask is not None:
-            if src_len > key_padding_mask.size(1):
-                filler = torch.zeros(
-                    (batch_size, src_len - key_padding_mask.size(1)),
-                    device=key_padding_mask.device,
-                )
-                new_key_padding_mask = torch.cat(
-                    [filler.float(), key_padding_mask.float()], dim=1
-                )
-            else:
-                new_key_padding_mask = key_padding_mask.float()
+            filler = torch.zeros(
+                (batch_size, src_len - key_padding_mask.size(1)),
+                device=key_padding_mask.device,
+            )
+            new_key_padding_mask = torch.cat(
+                [filler.float(), key_padding_mask.float()], dim=1
+            )
         else:
             new_key_padding_mask = prev_key_padding_mask
         return new_key_padding_mask

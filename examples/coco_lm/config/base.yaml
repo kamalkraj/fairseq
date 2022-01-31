@@ -1,0 +1,81 @@
+# @package _group_
+common:
+  fp16: true
+  log_format: json
+  log_interval: 200
+
+checkpoint:
+  no_epoch_checkpoints: true
+  reset_optimizer: true
+  reset_meters: true
+  reset_lr_scheduler: true
+
+task:
+  _name: cocolm
+  data: ???
+  sample_break_mode: complete_doc
+  span: 0.9
+  add_span_cls: true
+  tokens_per_sample: 512
+
+criterion: cocolm
+
+dataset:
+  batch_size: 16
+  ignore_unused_valid_subsets: true
+
+optimizer:
+  _name: adam
+  weight_decay: 0.01
+  adam_betas: (0.9,0.98)
+  adam_eps: 1e-06
+
+lr_scheduler:
+  _name: polynomial_decay
+  warmup_updates: 10000
+
+optimization:
+  clip_norm: 2.0
+  lr: [0.0005]
+  max_update: 125000
+  update_freq: [16]
+
+model:
+  _name: cocolm
+  task: cocolm
+  encoder_layers: 12
+  encoder_embed_dim: 768
+  encoder_ffn_embed_dim: 3072
+  encoder_attention_heads: 12
+  generator_layers: 4
+  generator_sample_mode: eval
+  activation_fn: gelu
+  pooler_activation_fn: tanh
+
+  dropout: 0.1
+  attention_dropout: 0.1
+  activation_dropout: 0.0
+  pooler_dropout: 0.1
+  encoder_layers_to_keep: null
+  encoder_layerdrop: 0.0
+  rel_pos: 1
+  binary_loss_weight: 50
+  mask_cls: False
+  rel_pos_bins: 64
+  max_rel_pos: 128
+  max_positions: 512
+
+  checkpoint_activations: false
+  offload_activations: false
+
+  quant_noise_pq: 0.0
+  quant_noise_pq_block_size: 8
+
+  seq_contrast: true
+  span: 0.9
+  add_span_cls: true
+  seq_contrast_dim: 768
+  temperature: 1.0
+  scl_loss_weight: 1
+
+  clm: true
