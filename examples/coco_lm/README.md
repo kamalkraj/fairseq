@@ -11,6 +11,21 @@ to demonstrate how to preprocess raw text data with the GPT-2 BPE. Of course
 this dataset is quite small, so the resulting pretrained model will perform
 poorly, but it gives the general idea.
 
+Enviornment
+```bash
+docker build -t fairseq .
+docker run --gpus all --ipc=host -v /home/kamal_raj/fairseq:/root/fairseq -it --rm fairseq
+cd fairseq
+pip install --editable ./
+pip install --editable fused_ops/
+git clone https://github.com/NVIDIA/apex
+cd apex
+pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" \
+  --global-option="--deprecated_fused_adam" --global-option="--xentropy" \
+  --global-option="--fast_multihead_attn" ./
+```
+
+
 First download the dataset:
 ```bash
 wget https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-raw-v1.zip
@@ -20,16 +35,17 @@ unzip wikitext-103-raw-v1.zip
 Next encode it with the GPT-2 BPE:
 ```bash
 mkdir -p dict
-cd dict
-wget https://github.com/microsoft/COCO-LM/releases/download/v0.1.0/dict.tar.gz
-tar -xzf dict.tar.gz
-cd ..
+wget https://dl.fbaipublicfiles.com/biolm/RoBERTa-base-PM-Voc-fairseq.tar.gz
+tar -xvzf RoBERTa-base-PM-Voc-fairseq.tar.gz
+cp RoBERTa-base-PM-Voc/RoBERTa-base-PM-Voc-fairseq/*.txt dict/
+cp RoBERTa-base-PM-Voc/RoBERTa-base-PM-Voc-fairseq/*.json dict/
+
 for SPLIT in train valid test; do \
-    python -m multiprocessing_sp_encoder \
-        --sentencepiece_model dict/sp.model \
-        --vocab dict/dict.txt \
-        --inputs wikitext-103-raw/wiki.${SPLIT}.raw \
-        --outputs wikitext-103-raw/wiki.${SPLIT}.bpe \
+    python -m examples.coco_lm.multiprocessing_bpe_encoder \
+        --encoder-json examples/coco_lm/dict/bpe-vocab.json \
+        --vocab-bpe examples/coco_lm/dict/bpe-merges.txt \
+        --inputs examples/coco_lm/wikitext-103-raw/wiki.${SPLIT}.raw \
+        --outputs examples/coco_lm/wikitext-103-raw/wiki.${SPLIT}.bpe \
         --keep-empty \
         --workers 60; \
 done
@@ -37,7 +53,7 @@ done
 
 Finally preprocess/binarize the data using the GPT-2 fairseq dictionary:
 ```bash
-python ../../fairseq_cli/preprocess.py \
+fairseq-preprocess \
     --only-source \
     --srcdict dict/dict.txt \
     --trainpref wikitext-103-raw/wiki.train.bpe \
