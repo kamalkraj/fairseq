@@ -11,23 +11,26 @@ import sys
 from collections import Counter
 from multiprocessing import Pool
 
-from fairseq.data.encoders.sentencepiece_bpe import SentencepieceBPE
+from fairseq.data.encoders.gpt2_bpe import get_encoder
 
 
 def main():
     """
-    Helper script to encode raw text with the SentencepieceBPE using multiple processes.
+    Helper script to encode raw text with the GPT-2 BPE using multiple processes.
 
+    The encoder.json and vocab.bpe files can be obtained here:
+    - https://dl.fbaipublicfiles.com/fairseq/gpt2_bpe/encoder.json
+    - https://dl.fbaipublicfiles.com/fairseq/gpt2_bpe/vocab.bpe
     """
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--sentencepiece_model",
+        "--encoder-json",
         help="path to encoder.json",
     )
     parser.add_argument(
-        "--vocab",
+        "--vocab-bpe",
         type=str,
-        help="path to vocab.txt",
+        help="path to vocab.bpe",
     )
     parser.add_argument(
         "--inputs",
@@ -91,12 +94,16 @@ class MultiprocessingEncoder(object):
 
     def initializer(self):
         global bpe
-        bpe = SentencepieceBPE(self.args)
+        bpe = get_encoder(self.args.encoder_json, self.args.vocab_bpe)
 
     def encode(self, line):
         global bpe
-        enc_line = ' '.join(bpe.tokenize(line))
-        return enc_line + '\n'
+        ids = bpe.encode(line)
+        return list(map(str, ids))
+
+    def decode(self, tokens):
+        global bpe
+        return bpe.decode(tokens)
 
     def encode_lines(self, lines):
         """
@@ -108,8 +115,15 @@ class MultiprocessingEncoder(object):
             if len(line) == 0 and not self.args.keep_empty:
                 return ["EMPTY", None]
             tokens = self.encode(line)
-            enc_lines.append(tokens)
+            enc_lines.append(" ".join(tokens))
         return ["PASS", enc_lines]
+
+    def decode_lines(self, lines):
+        dec_lines = []
+        for line in lines:
+            tokens = map(int, line.strip().split())
+            dec_lines.append(self.decode(tokens))
+        return ["PASS", dec_lines]
 
 
 if __name__ == "__main__":

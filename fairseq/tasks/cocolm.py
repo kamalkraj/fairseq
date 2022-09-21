@@ -133,7 +133,7 @@ class COCOLMTask(FairseqTask):
         self.dictionary = dictionary
 
         # get mask token
-        self.mask_idx = dictionary.index("[MASK]")
+        self.mask_idx = dictionary.add_symbol("<mask>")
 
     @classmethod
     def setup_task(cls, cfg: COCOLMConfig, **kwargs):
