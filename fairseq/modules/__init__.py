@@ -35,6 +35,7 @@ from .same_pad import SamePad
 from .scalar_bias import ScalarBias
 from .sinusoidal_positional_embedding import SinusoidalPositionalEmbedding
 from .transformer_sentence_encoder_layer import TransformerSentenceEncoderLayer
+from .deberta_layer import DebertaV2Layer
 from .transformer_sentence_encoder import TransformerSentenceEncoder
 from .transpose_last import TransposeLast
 from .unfold import unfold1d
