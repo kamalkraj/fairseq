@@ -19,15 +19,130 @@ from fairseq.models import (
 )
 from fairseq.modules import (
     LayerNorm,
-    TransformerSentenceEncoder,
+    DebertaV2Model,
 )
 
 from fairseq.models.squad import SQuADHead
 
-from fairseq.modules.transformer_sentence_encoder import init_bert_params
+from fairseq.modules.deberta_encoder import init_bert_params
 from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
 
 logger = logging.getLogger(__name__)
+
+
+class DebertaV2Config():
+    r"""
+    This is the configuration class to store the configuration of a [`DebertaV2Model`]. It is used to instantiate a
+    DeBERTa-v2 model according to the specified arguments, defining the model architecture. Instantiating a
+    configuration with the defaults will yield a similar configuration to that of the DeBERTa
+    [microsoft/deberta-v2-xlarge](https://huggingface.co/microsoft/deberta-v2-xlarge) architecture.
+    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
+    documentation from [`PretrainedConfig`] for more information.
+    Arguments:
+        vocab_size (`int`, *optional*, defaults to 128100):
+            Vocabulary size of the DeBERTa-v2 model. Defines the number of different tokens that can be represented by
+            the `inputs_ids` passed when calling [`DebertaV2Model`].
+        hidden_size (`int`, *optional*, defaults to 1536):
+            Dimensionality of the encoder layers and the pooler layer.
+        num_hidden_layers (`int`, *optional*, defaults to 24):
+            Number of hidden layers in the Transformer encoder.
+        num_attention_heads (`int`, *optional*, defaults to 24):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        intermediate_size (`int`, *optional*, defaults to 6144):
+            Dimensionality of the "intermediate" (often named feed-forward) layer in the Transformer encoder.
+        hidden_act (`str` or `Callable`, *optional*, defaults to `"gelu"`):
+            The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
+            `"relu"`, `"silu"`, `"gelu"`, `"tanh"`, `"gelu_fast"`, `"mish"`, `"linear"`, `"sigmoid"` and `"gelu_new"`
+            are supported.
+        hidden_dropout_prob (`float`, *optional*, defaults to 0.1):
+            The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
+        attention_probs_dropout_prob (`float`, *optional*, defaults to 0.1):
+            The dropout ratio for the attention probabilities.
+        max_position_embeddings (`int`, *optional*, defaults to 512):
+            The maximum sequence length that this model might ever be used with. Typically set this to something large
+            just in case (e.g., 512 or 1024 or 2048).
+        type_vocab_size (`int`, *optional*, defaults to 0):
+            The vocabulary size of the `token_type_ids` passed when calling [`DebertaModel`] or [`TFDebertaModel`].
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        layer_norm_eps (`float`, *optional*, defaults to 1e-7):
+            The epsilon used by the layer normalization layers.
+        relative_attention (`bool`, *optional*, defaults to `True`):
+            Whether use relative position encoding.
+        max_relative_positions (`int`, *optional*, defaults to -1):
+            The range of relative positions `[-max_position_embeddings, max_position_embeddings]`. Use the same value
+            as `max_position_embeddings`.
+        pad_token_id (`int`, *optional*, defaults to 0):
+            The value used to pad input_ids.
+        position_biased_input (`bool`, *optional*, defaults to `False`):
+            Whether add absolute position embedding to content embedding.
+        pos_att_type (`List[str]`, *optional*):
+            The type of relative position attention, it can be a combination of `["p2c", "c2p"]`, e.g. `["p2c"]`,
+            `["p2c", "c2p"]`, `["p2c", "c2p"]`.
+        layer_norm_eps (`float`, optional, defaults to 1e-12):
+            The epsilon used by the layer normalization layers.
+    """
+    model_type = "deberta-v2"
+
+    def __init__(
+        self,
+        vocab_size=128100,
+        hidden_size=1536,
+        num_hidden_layers=24,
+        num_attention_heads=24,
+        intermediate_size=6144,
+        hidden_act="gelu",
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        max_position_embeddings=512,
+        type_vocab_size=0,
+        initializer_range=0.02,
+        layer_norm_eps=1e-7,
+        relative_attention=False,
+        max_relative_positions=-1,
+        pad_token_id=0,
+        position_biased_input=True,
+        share_att_key=False,
+        norm_rel_ebd=None,
+        position_buckets=None,
+        pos_att_type=None,
+        pooler_dropout=0,
+        pooler_hidden_act="gelu",
+        output_attentions=False,
+        **kwargs
+    ):
+
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.intermediate_size = intermediate_size
+        self.hidden_act = hidden_act
+        self.hidden_dropout_prob = hidden_dropout_prob
+        self.attention_probs_dropout_prob = attention_probs_dropout_prob
+        self.max_position_embeddings = max_position_embeddings
+        self.type_vocab_size = type_vocab_size
+        self.initializer_range = initializer_range
+        self.relative_attention = relative_attention
+        self.max_relative_positions = max_relative_positions
+        self.pad_token_id = pad_token_id
+        self.position_biased_input = position_biased_input
+        self.share_att_key = share_att_key
+        self.norm_rel_ebd = norm_rel_ebd
+        self.position_buckets = position_buckets
+
+        # Backwards compatibility
+        if type(pos_att_type) == str:
+            pos_att_type = [x.strip() for x in pos_att_type.lower().split("|")]
+
+        self.pos_att_type = pos_att_type
+        self.vocab_size = vocab_size
+        self.layer_norm_eps = layer_norm_eps
+
+        self.pooler_hidden_size = kwargs.get("pooler_hidden_size", hidden_size)
+        self.pooler_dropout = pooler_dropout
+        self.pooler_hidden_act = pooler_hidden_act
+        self.output_attentions=output_attentions
+        self.use_return_dict=False
 
 
 @register_model("cocolm")
@@ -214,6 +329,7 @@ class COCOLM_Model(FairseqEncoderModel):
 
         if not hasattr(args, "max_positions"):
             args.max_positions = args.tokens_per_sample
+        
 
         main_encoder = GenEncoder(args, task.source_dictionary)
         if args.task == "cocolm":
@@ -244,9 +360,9 @@ class COCOLM_Model(FairseqEncoderModel):
             seq_contrast = False
 
         def get_padding_mask(tokens):
-            padding_mask = tokens.eq(self.encoder.sentence_encoder.padding_idx)
-            if not padding_mask.any():
-                padding_mask = None
+            padding_mask = tokens.eq(self.encoder.sentence_encoder.config.pad_token_id)
+            # if not padding_mask.any():
+            #     padding_mask = None
             return padding_mask
 
         padding_mask = get_padding_mask(src_tokens)
@@ -572,48 +688,46 @@ class Generator(FairseqEncoder):
         super().__init__(dictionary)
         self.args = args
 
-        self.sentence_encoder = TransformerSentenceEncoder(
-            padding_idx=dictionary.pad(),
+        config = DebertaV2Config(
             vocab_size=len(dictionary),
-            num_encoder_layers=args.generator_layers,
-            embedding_dim=int(args.encoder_embed_dim),
-            ffn_embedding_dim=int(args.encoder_ffn_embed_dim),
-            num_attention_heads=int(args.encoder_attention_heads),
-            dropout=args.dropout if args.generator_sample_mode != "zero-dropout" else 0,
-            attention_dropout=args.attention_dropout
-            if args.generator_sample_mode != "zero-dropout"
-            else 0,
-            activation_dropout=args.activation_dropout
-            if args.generator_sample_mode != "zero-dropout"
-            else 0,
-            layerdrop=args.encoder_layerdrop,
-            max_seq_len=args.max_positions,
-            num_segments=0,
-            encoder_normalize_before=False,
-            apply_bert_init=True,
-            activation_fn=args.activation_fn,
-            q_noise=args.quant_noise_pq,
-            qn_block_size=args.quant_noise_pq_block_size,
-            rel_pos=args.rel_pos,
-            checkpoint_activations=args.checkpoint_activations,
-            offload_activations=args.offload_activations,
-            share_embed_tokens=main_encoder.sentence_encoder.embed_tokens,
-            share_embed_positions=main_encoder.sentence_encoder.embed_positions
-            if args.generator_sample_mode != "zero-dropout"
-            else None,
-            share_emb_layer_norm=main_encoder.sentence_encoder.emb_layer_norm
-            if args.generator_sample_mode != "zero-dropout"
-            else None,
-            shared_embedding_dim=args.encoder_embed_dim,
-            rel_pos_bins=args.rel_pos_bins,
-            max_rel_pos=args.max_rel_pos,
+            hidden_size=768,
+            num_hidden_layers=12,
+            num_attention_heads=12,
+            intermediate_size=3072,
+            hidden_act="gelu",
+            hidden_dropout_prob=0.1,
+            attention_probs_dropout_prob=0.1,
+            max_position_embeddings=512,
+            type_vocab_size=0,
+            initializer_range=0.02,
+            layer_norm_eps=1e-7,
+            relative_attention=True,
+            max_relative_positions=-1,
+            pad_token_id=dictionary.pad(),
+            position_biased_input=False,
+            share_att_key=True,
+            norm_rel_ebd="layer_norm",
+            position_buckets=256,
+            pos_att_type="p2c|c2p",
+            pooler_dropout=0,
+            pooler_hidden_act="gelu",
+            output_attentions=False,
         )
+        config.hidden_dropout_prob = 0.1 if args.generator_sample_mode != "zero-dropout" else 0
+        config.attention_probs_dropout_prob = 0.1 if args.generator_sample_mode != "zero-dropout" else 0
+        
+        self.sentence_encoder = DebertaV2Model(
+            config=config,
+            share_embed_tokens=main_encoder.sentence_encoder.get_input_embeddings(),
+            share_emb_layer_norm=main_encoder.sentence_encoder.get_input_embeddings_layer_norm() if args.generator_sample_mode != "zero-dropout" else None,
+        )
+
         self.lm_head = MaskedLMHead(
             hidden_dim=int(args.encoder_embed_dim),
             embed_dim=int(args.encoder_embed_dim),
             output_dim=len(dictionary),
             activation_fn=args.activation_fn,
-            weight=main_encoder.sentence_encoder.embed_tokens.weight,
+            weight=main_encoder.sentence_encoder.get_input_embeddings().weight,
         )
 
     def forward(
@@ -650,9 +764,8 @@ class Generator(FairseqEncoder):
     ):
         inner_states, _ = self.sentence_encoder(
             src_tokens,
-            last_state_only=not return_all_hiddens,
-            use_ext_padding_mask=True,
-            padding_mask=padding_mask,
+            attention_mask=1-padding_mask.int(),
+            output_hidden_states=return_all_hiddens,
         )
         features = inner_states[-1]
         return features, {"inner_states": inner_states if return_all_hiddens else None}
@@ -678,29 +791,34 @@ class GenEncoder(FairseqEncoder):
         if args.encoder_layers_to_keep:
             args.encoder_layers = len(args.encoder_layers_to_keep.split(","))
 
-        self.sentence_encoder = TransformerSentenceEncoder(
-            padding_idx=dictionary.pad(),
+        config = DebertaV2Config(
             vocab_size=len(dictionary),
-            num_encoder_layers=args.encoder_layers,
-            embedding_dim=args.encoder_embed_dim,
-            ffn_embedding_dim=args.encoder_ffn_embed_dim,
-            num_attention_heads=args.encoder_attention_heads,
-            dropout=args.dropout,
-            attention_dropout=args.attention_dropout,
-            activation_dropout=args.activation_dropout,
-            layerdrop=args.encoder_layerdrop,
-            max_seq_len=args.max_positions,
-            num_segments=0,
-            encoder_normalize_before=False,
-            apply_bert_init=True,
-            activation_fn=args.activation_fn,
-            q_noise=args.quant_noise_pq,
-            qn_block_size=args.quant_noise_pq_block_size,
-            rel_pos=args.rel_pos,
-            checkpoint_activations=args.checkpoint_activations,
-            offload_activations=args.offload_activations,
-            rel_pos_bins=args.rel_pos_bins,
-            max_rel_pos=args.max_rel_pos,
+            hidden_size=768,
+            num_hidden_layers=12,
+            num_attention_heads=12,
+            intermediate_size=3072,
+            hidden_act="gelu",
+            hidden_dropout_prob=0.1,
+            attention_probs_dropout_prob=0.1,
+            max_position_embeddings=512,
+            type_vocab_size=0,
+            initializer_range=0.02,
+            layer_norm_eps=1e-7,
+            relative_attention=True,
+            max_relative_positions=-1,
+            pad_token_id=dictionary.pad(),
+            position_biased_input=False,
+            share_att_key=True,
+            norm_rel_ebd="layer_norm",
+            position_buckets=256,
+            pos_att_type="p2c|c2p",
+            pooler_dropout=0,
+            pooler_hidden_act="gelu",
+            output_attentions=False,
+        )
+            
+        self.sentence_encoder = DebertaV2Model(
+            config=config
         )
         self.binary_head = BinaryHead(
             embed_dim=int(args.encoder_embed_dim),
@@ -709,7 +827,7 @@ class GenEncoder(FairseqEncoder):
         if args.clm:
             self.lm_head = CLMHead(
                 output_dim=len(dictionary),
-                weight=self.sentence_encoder.embed_tokens.weight,
+                weight=self.sentence_encoder.get_input_embeddings().weight,
             )
         else:
             self.lm_head = None
@@ -762,9 +880,8 @@ class GenEncoder(FairseqEncoder):
     ):
         inner_states, _ = self.sentence_encoder(
             src_tokens,
-            last_state_only=not return_all_hiddens,
-            use_ext_padding_mask=True,
-            padding_mask=padding_mask,
+            attention_mask=1-padding_mask.int(),
+            output_hidden_states=return_all_hiddens,
         )
         features = inner_states[-1]
         return features, {"inner_states": inner_states if return_all_hiddens else None}

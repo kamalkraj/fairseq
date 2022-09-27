@@ -302,8 +302,7 @@ class DebertaV2Model(nn.Module):
         if share_emb_layer_norm != None:
             self.set_input_embeddings_layer_norm(share_emb_layer_norm)
         # Initialize weights and apply final processing
-        if self.apply_bert_init:
-            self.apply(init_bert_params)
+        self.apply(init_bert_params)
 
     def get_input_embeddings(self):
         return self.embeddings.word_embeddings
