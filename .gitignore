@@ -139,3 +139,10 @@ wandb/
 nohup.out
 multirun
 outputs
+examples/coco_lm/pubmed_data/*
+examples/coco_lm/dict/*
+examples/coco_lm/pubmed_data_sent/*
+
+multirun_old
+data-bin_sent
+multirun_bkp
