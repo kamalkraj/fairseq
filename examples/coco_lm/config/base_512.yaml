@@ -13,13 +13,13 @@ task:
   sample_break_mode: complete_doc
   span: 0.9
   add_span_cls: true
-  tokens_per_sample: 128
+  tokens_per_sample: 512
   shorten_method: truncate
 
 criterion: cocolm
 
 dataset:
-  batch_size: 64
+  batch_size: 8
   ignore_unused_valid_subsets: true
   disable_validation : true
   skip_invalid_size_inputs_valid_test: true
@@ -39,7 +39,7 @@ optimization:
   clip_norm: 2.0
   lr: [0.0005]
   max_update: 250000
-  update_freq: [4]
+  update_freq: [32]
 
 model:
   _name: cocolm
