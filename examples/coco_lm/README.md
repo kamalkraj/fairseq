@@ -14,7 +14,7 @@ poorly, but it gives the general idea.
 Enviornment
 ```bash
 docker build -t fairseq .
-docker run --gpus all --ipc=host -v /home/kamal_raj/fairseq:/root/fairseq -it --rm fairseq
+docker run --gpus all --ipc=host -v /home/ubuntu/fairseq:/root/fairseq -it --rm fairseq
 cd fairseq
 pip install --editable ./
 pip install --editable fused_ops/
@@ -41,13 +41,13 @@ cp RoBERTa-base-PM-Voc/RoBERTa-base-PM-Voc-fairseq/*.txt dict/
 cp RoBERTa-base-PM-Voc/RoBERTa-base-PM-Voc-fairseq/*.json dict/
 
 for SPLIT in train valid test; do \
-    python -m examples.coco_lm.multiprocessing_bpe_encoder \
-        --encoder-json examples/coco_lm/dict/bpe-vocab.json \
-        --vocab-bpe examples/coco_lm/dict/bpe-merges.txt \
-        --inputs examples/coco_lm/wikitext-103-raw/wiki.${SPLIT}.raw \
-        --outputs examples/coco_lm/wikitext-103-raw/wiki.${SPLIT}.bpe \
+    python3 -m multiprocessing_bpe_encoder \
+        --encoder-json dict/bpe-vocab.json \
+        --vocab-bpe dict/bpe-merges.txt \
+        --inputs pubmed_data_sent/pubmed.${SPLIT}.txt \
+        --outputs pubmed_data_sent/pubmed.${SPLIT}.bpe \
         --keep-empty \
-        --workers 60; \
+        --workers 64; \
 done
 ```
 
@@ -56,17 +56,16 @@ Finally preprocess/binarize the data using the GPT-2 fairseq dictionary:
 fairseq-preprocess \
     --only-source \
     --srcdict dict/dict.txt \
-    --trainpref wikitext-103-raw/wiki.train.bpe \
-    --validpref wikitext-103-raw/wiki.valid.bpe \
-    --testpref wikitext-103-raw/wiki.test.bpe \
-    --destdir data-bin/wikitext-103 \
+    --trainpref pubmed_data_sent/pubmed.train.bpe \
+    --validpref pubmed_data_sent/pubmed.valid.bpe \
+    --testpref pubmed_data_sent/pubmed.test.bpe \
+    --destdir data-bin_sent/pubmed \
     --workers 60
-cp dict/dict.txt data-bin/wikitext-103/dict.txt
 ```
 
 ### 2) Train RoBERTa base
 ```bash
-DATA_DIR=$(pwd)/data-bin/wikitext-103/
+DATA_DIR=$(pwd)/data-bin_sent/pubmed/
 
 fairseq-hydra-train -m --config-dir config/ \
 --config-name base task.data=$DATA_DIR
