@@ -764,7 +764,7 @@ class Generator(FairseqEncoder):
     ):
         inner_states, _ = self.sentence_encoder(
             src_tokens,
-            attention_mask=1-padding_mask.int() if padding_mask else None,
+            attention_mask=1-padding_mask.int() if padding_mask != None else None,
             output_hidden_states=return_all_hiddens,
         )
         features = inner_states[-1]
@@ -880,7 +880,7 @@ class GenEncoder(FairseqEncoder):
     ):
         inner_states, _ = self.sentence_encoder(
             src_tokens,
-            attention_mask=1-padding_mask.int() if padding_mask else None,
+            attention_mask=1-padding_mask.int() if padding_mask != None else None,
             output_hidden_states=return_all_hiddens,
         )
         features = inner_states[-1]
