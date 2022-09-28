@@ -361,8 +361,8 @@ class COCOLM_Model(FairseqEncoderModel):
 
         def get_padding_mask(tokens):
             padding_mask = tokens.eq(self.encoder.sentence_encoder.config.pad_token_id)
-            # if not padding_mask.any():
-            #     padding_mask = None
+            if not padding_mask.any():
+                padding_mask = None
             return padding_mask
 
         padding_mask = get_padding_mask(src_tokens)
@@ -764,7 +764,7 @@ class Generator(FairseqEncoder):
     ):
         inner_states, _ = self.sentence_encoder(
             src_tokens,
-            attention_mask=1-padding_mask.int(),
+            attention_mask=1-padding_mask.int() if padding_mask else None,
             output_hidden_states=return_all_hiddens,
         )
         features = inner_states[-1]
@@ -880,7 +880,7 @@ class GenEncoder(FairseqEncoder):
     ):
         inner_states, _ = self.sentence_encoder(
             src_tokens,
-            attention_mask=1-padding_mask.int(),
+            attention_mask=1-padding_mask.int() if padding_mask else None,
             output_hidden_states=return_all_hiddens,
         )
         features = inner_states[-1]
